@@ -4,7 +4,7 @@ provider "azurerm" {
 }
 
 variable "prefix" {
-  default = "frontend2"
+  default = "frontend"
 }
 
 resource "azurerm_resource_group" "main" {
@@ -15,7 +15,7 @@ resource "azurerm_resource_group" "main" {
 
 resource "azurerm_virtual_network" "main" {
   name                = "${var.prefix}-network"
-  address_space       = ["10.0.0.0/23"]
+  address_space       = ["10.1.0.0/24"]
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
 }
@@ -24,17 +24,19 @@ resource "azurerm_subnet" "external" {
   name                 = "external"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.0.0.0/24"]
+  address_prefixes     = ["10.1.0.0/26"]
 }
 
 resource "azurerm_subnet" "AzureFirewallSubnet" {
   name                 = "AzureFirewallSubnet"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.0.0.0/24"]
+  address_prefixes     = ["10.1.0.64/26"]
 }
 
-resource "azurerm_network_interface" "main" {
+/*
+
+resource "azurerm_lb" "main" {
   name                = "${var.prefix}-nic"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
@@ -42,11 +44,12 @@ resource "azurerm_network_interface" "main" {
   ip_configuration {
     name                          = "testconfiguration1"
     subnet_id                     = azurerm_subnet.external.id
-    private_ip_address_allocation = "Dynamic"
-    public_ip_address_id = azurerm_public_ip.pip.id 
+    private_ip_address_allocation = "static"
+
   }
 }
 
+*/
 resource "azurerm_firewall" "fire" {
       name                = "${var.prefix}-firewall"
   location            = azurerm_resource_group.main.location
@@ -61,12 +64,31 @@ resource "azurerm_firewall" "fire" {
 }
 
 
-resource "azurerm_firewall_nat_rule_collection" "example" {
+resource "azurerm_firewall_nat_rule_collection" "main" {
   name                = "testcollection"
   azure_firewall_name = azurerm_firewall.fire.name
   resource_group_name = azurerm_resource_group.main.name
   priority            = 100
   action              = "Dnat"
+
+  rule {
+    name = "web-rule"
+    source_addresses = [
+      "*",
+    ]
+    destination_ports = [
+      "80",
+    ]
+    destination_addresses = [
+      azurerm_public_ip.pip.ip_address
+    ]
+    translated_port    = 80
+    translated_address = "${azurerm_lb.main.private_ip_address}"
+
+    protocols = [
+      "TCP",
+    ]
+  }
 
   rule {
     name = "allowrdp"
@@ -85,7 +107,7 @@ resource "azurerm_firewall_nat_rule_collection" "example" {
 
     translated_port = 3389
 
-    translated_address = azurerm_network_interface.main.private_ip_address
+    translated_address = "${azurerm_lb.main.private_ip_address}"
 
     protocols = [
       "TCP"
@@ -128,43 +150,75 @@ resource "azurerm_public_ip" "pip" {
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
   allocation_method   = "Static"
+  sku                 =  "standard"
   
 }
 
-resource "azurerm_virtual_machine" "main" {
-  name                  = "${var.prefix}-vm"
-  location              = azurerm_resource_group.main.location
-  resource_group_name   = azurerm_resource_group.main.name
-  network_interface_ids = [azurerm_network_interface.main.id]
-  vm_size               = "Standard_DS1_v2"
+resource "azurerm_lb" "main" {
+  name                = "frntndlb"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
 
-  # Uncomment this line to delete the OS disk automatically when deleting the VM
-  # delete_os_disk_on_termination = true
-
-  # Uncomment this line to delete the data disks automatically when deleting the VM
-  # delete_data_disks_on_termination = true
-
-  storage_image_reference {
-    publisher = "Canonical"
-    offer     = "UbuntuServer"
-    sku       = "16.04-LTS"
-    version   = "latest"
-  }
-  storage_os_disk {
-    name              = "myosdisk1"
-    caching           = "ReadWrite"
-    create_option     = "FromImage"
-    managed_disk_type = "Standard_LRS"
-  }
-  os_profile {
-    computer_name  = "hostname"
-    admin_username = "testadmin"
-    admin_password = "Password1234!"
-  }
-  os_profile_linux_config {
-    disable_password_authentication = false
-  }
-  tags = {
-    environment = "staging"
+  frontend_ip_configuration {
+    name                 = "privateIPAddress"
+    subnet_id                     = azurerm_subnet.internal.id
+    private_ip_address_allocation = "Dynamic"
   }
 }
+resource "azurerm_lb_backend_address_pool" "main" {
+  resource_group_name = azurerm_resource_group.main.name
+  loadbalancer_id     = azurerm_lb.main.id
+  name                = "BackEndAddressPool"
+}
+resource "azurerm_lb_nat_pool" "main" {
+  resource_group_name            = azurerm_resource_group.main.name
+  name                           = "rdp"
+  loadbalancer_id                = azurerm_lb.main.id
+  protocol                       = "Tcp"
+  frontend_port_start            = 3389
+  frontend_port_end              = 50119
+  backend_port                   = 3389
+  frontend_ip_configuration_name = "privateIPAddress"
+}
+
+resource "azurerm_lb_probe" "main" {
+  resource_group_name = azurerm_resource_group.main.name
+  loadbalancer_id     = azurerm_lb.main.id
+  name                = "http-probe"
+  protocol            = "Http"
+  request_path        = "/health"
+  port                = 8080
+}
+resource "azurerm_windows_virtual_machine_scale_set" "main" {
+  name                = "jb-vmss"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  sku                 = "Standard_F2"
+  instances           = 1
+  admin_password      = "rd "
+  admin_username      = "adminuser"
+
+  source_image_reference {
+    publisher = "MicrosoftWindowsServer"
+    offer     = "WindowsServer"
+    sku       = "2016-Datacenter-Server-Core"
+    version   = "latest"
+  }
+
+  os_disk {
+    storage_account_type = "Standard_LRS"
+    caching              = "ReadWrite"
+  }
+    network_interface {
+    name    = "backend-nic"
+    primary = true
+
+    ip_configuration {
+      name                                   = "TestIPConfiguration"
+      primary                                = true
+      subnet_id                              = azurerm_subnet.internal.id
+      load_balancer_backend_address_pool_ids = [azurerm_lb_backend_address_pool.main.id]
+      load_balancer_inbound_nat_rules_ids    = [azurerm_lb_nat_pool.main.id]
+    }
+  }
+ }
